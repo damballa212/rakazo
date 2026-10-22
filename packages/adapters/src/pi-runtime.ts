@@ -2694,9 +2694,16 @@ function fallbackAwareModelStream(
                 break;
               }
               firstRetryableError ??= event;
-              const delay = isProviderTimeout(event.error)
-                ? undefined
-                : MODEL_PROVIDER_RETRY_DELAYS_MS[retries];
+              const codexIdle =
+                isCodexModel(target.model) &&
+                event.error.errorMessage === CODEX_STREAM_IDLE_TIMEOUT_MESSAGE;
+              // Retry only this empty model call once. Its context already contains
+              // completed tools; the partial-output/abort guards above prevent replay.
+              const delay = codexIdle
+                ? retries === 0 ? MODEL_PROVIDER_RETRY_DELAYS_MS[0] : undefined
+                : isProviderTimeout(event.error)
+                  ? undefined
+                  : MODEL_PROVIDER_RETRY_DELAYS_MS[retries];
               if (delay !== undefined) {
                 retries += 1;
                 await abortableDelay(delay, signal);
@@ -2826,6 +2833,8 @@ export interface StreamIdleWatchdog {
   wrap(stream: AssistantMessageEventStream): AssistantMessageEventStream;
   /** Stops the timer and drops the caller-signal listener. */
   dispose(): void;
+  /** Counts raw provider event types only; never retains event content. */
+  observeProviderEvent(event: unknown): void;
 }
 
 /**
@@ -2854,6 +2863,10 @@ export function codexStreamIdleWatchdog(
   let timedOut = false;
   let disposed = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let rawEvents = 0;
+  let normalizedEvents = 0;
+  let lastRawAt: number | undefined;
+  let lastRawType: string | undefined;
 
   const onUpstreamAbort = () => controller.abort(upstream?.reason);
   if (upstream?.aborted) controller.abort(upstream.reason);
@@ -2865,6 +2878,12 @@ export function codexStreamIdleWatchdog(
       timer = undefined;
       if (controller.signal.aborted) return;
       timedOut = true;
+      getLogger().warn("Codex stream idle diagnostics", {
+        rawEvents,
+        normalizedEvents,
+        lastRawType,
+        millisecondsSinceRawEvent: lastRawAt === undefined ? null : Date.now() - lastRawAt,
+      });
       controller.abort(new Error(CODEX_STREAM_IDLE_TIMEOUT_MESSAGE));
     }, idleTimeoutMs);
     timer.unref?.();
@@ -2906,11 +2925,18 @@ export function codexStreamIdleWatchdog(
     signal: controller.signal,
     ping,
     dispose,
+    observeProviderEvent(event) {
+      rawEvents += 1;
+      lastRawAt = Date.now();
+      const type = event && typeof event === "object" && "type" in event ? event.type : undefined;
+      lastRawType = typeof type === "string" && /^[a-zA-Z0-9_.-]{1,80}$/.test(type) ? type : "other";
+    },
     wrap(inner) {
       class Watched extends AssistantMessageEventStream {
         override async *[Symbol.asyncIterator](): AsyncGenerator<AssistantMessageEvent> {
           try {
             for await (const event of inner) {
+              normalizedEvents += 1;
               ping();
               yield rewrite(event);
             }
@@ -3009,6 +3035,10 @@ export function reliableModelStream(
             ...options,
             signal: watchdog.signal,
             fetch: codexRequestFetch(options?.fetch, MODEL_STREAM_IDLE_TIMEOUT_MS),
+            onProviderStreamEvent: (event, requestModel) => {
+              watchdog.observeProviderEvent(event);
+              return options?.onProviderStreamEvent?.(event, requestModel);
+            },
             // Only a 2xx arms the shared watchdog. Error bodies are bounded by
             // the fetch wrapper, and a caller-supplied hook still sees every status.
             onResponse: (response, requestModel) => {

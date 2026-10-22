@@ -242,6 +242,32 @@ describe("Codex stream idle watchdog", () => {
 describe("reliableModelStream idle gating", () => {
   afterEach(() => vi.useRealTimers());
 
+  it("preserves both arguments of the raw provider event callback", async () => {
+    const inner = new AssistantMessageEventStream();
+    const streamSimple = vi.fn((_model: Model<Api>, _context: Context, _options?: SimpleStreamOptions) => inner);
+    const onProviderStreamEvent = vi.fn();
+    reliableModelStream({ streamSimple } as unknown as Models, codexModel, context, { onProviderStreamEvent }, undefined);
+    const guarded = streamSimple.mock.calls[0]?.[2];
+    const event = { type: "response.created", ignoredContent: "never logged" };
+    await guarded?.onProviderStreamEvent?.(event, codexModel);
+    expect(onProviderStreamEvent).toHaveBeenCalledWith(event, codexModel);
+    inner.push({ type: "done", reason: "stop", message: assistantMessage() });
+    inner.end();
+  });
+
+  it("counts raw activity without extending the normalized-output idle bound", async () => {
+    vi.useFakeTimers();
+    const watchdog = codexStreamIdleWatchdog(undefined, 100);
+    watchdog.ping();
+    await vi.advanceTimersByTimeAsync(90);
+    watchdog.observeProviderEvent({ type: "response.in_progress", secret: "not retained" });
+    expect(watchdog.signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(watchdog.signal.aborted).toBe(true);
+    watchdog.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("hands Codex a composed signal while other providers keep the caller's", async () => {
     vi.useFakeTimers();
     const caller = new AbortController();

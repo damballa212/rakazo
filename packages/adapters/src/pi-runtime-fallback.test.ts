@@ -293,6 +293,55 @@ describe("Pi runtime transient model retries", () => {
     expect(providerState.delay).not.toHaveBeenCalled();
   });
 
+  it("retries one empty Codex idle stream without a fallback", async () => {
+    const codex = { ...primary, provider: "openai-codex", api: "openai-codex-responses" } as unknown as typeof primary;
+    providerState.models.set(`${codex.provider}/${codex.id}`, codex);
+    providerState.stream
+      .mockImplementationOnce(() => stream(codex, message(codex, [], "error", "Codex stream idle timeout")))
+      .mockImplementation(() => stream(codex, message(codex, [{ type: "text", text: "Recovered." }], "stop")));
+    const input = request();
+    input.model.provider = codex.provider;
+    expect(await run(input)).toContainEqual({ type: "text", text: "Recovered." });
+    expect(providerState.stream).toHaveBeenCalledTimes(2);
+    expect(providerState.delay.mock.calls.map(([delay]) => delay)).toEqual([2_000]);
+  });
+
+  it("caps empty Codex idle recovery at one retry", async () => {
+    const codex = { ...primary, provider: "openai-codex", api: "openai-codex-responses" } as unknown as typeof primary;
+    providerState.models.set(`${codex.provider}/${codex.id}`, codex);
+    providerState.stream.mockImplementation(() => stream(codex, message(codex, [], "error", "Codex stream idle timeout")));
+    const input = request();
+    input.model.provider = codex.provider;
+    await expect(run(input)).rejects.toThrow("Codex stream idle timeout");
+    expect(providerState.stream).toHaveBeenCalledTimes(2);
+    expect(providerState.delay.mock.calls.map(([delay]) => delay)).toEqual([2_000]);
+  });
+
+  it("recovers an empty idle stream after a tool without executing the tool again", async () => {
+    const codex = { ...primary, provider: "openai-codex", api: "openai-codex-responses" } as unknown as typeof primary;
+    providerState.models.set(`${codex.provider}/${codex.id}`, codex);
+    providerState.stream
+      .mockImplementationOnce(() => stream(codex, message(codex, [{ type: "toolCall", id: "effect-once", name: "write_effect", arguments: { value: "once" } }], "toolUse")))
+      .mockImplementationOnce(() => stream(codex, message(codex, [], "error", "Codex stream idle timeout")))
+      .mockImplementation(() => stream(codex, message(codex, [{ type: "text", text: "Recovered after tool." }], "stop")));
+    const input = request();
+    input.model.provider = codex.provider;
+    expect(await run(input)).toContainEqual({ type: "text", text: "Recovered after tool." });
+    expect(providerState.stream).toHaveBeenCalledTimes(3);
+    expect(input.executeTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry idle after partial text", async () => {
+    const codex = { ...primary, provider: "openai-codex", api: "openai-codex-responses" } as unknown as typeof primary;
+    providerState.models.set(`${codex.provider}/${codex.id}`, codex);
+    providerState.stream.mockImplementation(() => stream(codex, message(codex, [{ type: "text", text: "partial" }], "error", "Codex stream idle timeout")));
+    const input = request();
+    input.model.provider = codex.provider;
+    await expect(run(input)).rejects.toThrow("Codex stream idle timeout");
+    expect(providerState.stream).toHaveBeenCalledTimes(1);
+    expect(providerState.delay).not.toHaveBeenCalled();
+  });
+
   it("surfaces a non-retryable error encountered after a transient failure", async () => {
     providerState.stream
       .mockImplementationOnce(() => stream(primary, message(primary, [], "error", "terminated")))
@@ -302,7 +351,7 @@ describe("Pi runtime transient model retries", () => {
     expect(providerState.delay.mock.calls.map(([delay]) => delay)).toEqual([2_000]);
   });
 
-  it.each(["terminated", "Stream ended without finish_reason"])(
+  it.each(["terminated", "Stream ended without finish_reason", "Codex stream idle timeout"])(
     "does not retry after a tool call starts even if %s omits it",
     async (error) => {
       const failure = message(primary, [], "error", error);
